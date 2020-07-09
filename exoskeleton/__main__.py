@@ -30,7 +30,9 @@ import userprovided
 import bote
 
 # import other modules of this framework
+
 import exoskeleton.utils as utils
+from exoskeleton.database import Database
 
 
 class Exoskeleton:
@@ -60,11 +62,15 @@ class Exoskeleton:
 
         logging.info('You are using exoskeleton 0.9.2 (beta / July 7, 2020)')
 
+        self.connection_timeout = None
+        self.connection: pymysql.Connection
+        self.cur: pymysql.cursors.Cursor
+
         self.project = project_name.strip()
         self.user_agent = bot_user_agent.strip()
 
         # Database Setup / Establish a Database Connection
-        self.__prepare_database(database_settings)
+        self._prepare_database(database_settings)
 
         # Mail / Notification Setup
         self.__prepare_mailing(mail_behavior, mail_settings)
@@ -121,26 +127,35 @@ class Exoskeleton:
             raise ValueError('The hash method SHA256 is not available on ' +
                              'your system.')
 
-    def __prepare_database(self, database_settings):
-        self.db_host: Optional[str] = None
-        self.db_port: Optional[int] = None
-        self.db_name: str
-        self.db_username: str
-        self.db_passphrase: str
+    def _prepare_database(self, database_settings):
+        # Check our dictionary to be not empty and contain every necessary key
+        self._check_database_settings(database_settings)
+        # Configure the database and validate all parameters
+        self.database: Database = Database(database_settings.get("host"))\
+            .port(database_settings.get("port"))\
+            .database(database_settings.get('database'))\
+            .username(database_settings.get("username"))\
+            .password(database_settings.get("passphrase"))
+        # Establish a connection
+        self.connection = self.database.connect()
+        # Check the schema:
+        self.database.check_schema_compatibility()
+
+        self.cur: pymysql.cursors.Cursor = self.connection.cursor()
+
+    @staticmethod
+    def _check_database_settings(database_settings: dict):
+        u"""Check the database settings for plausibility. """
         if database_settings is None:
             raise ValueError('You must supply database credentials for' +
                              'exoskeleton to work.')
-        else:
-            self.__check_database_settings(database_settings)
-        # Establish the connection:
-        self.connection = None
-        self.establish_db_connection()
-        # Add ignore for mypy as it cannot be None at this point, because
-        # establish_db_connection would have failed before:
-        self.cur = self.connection.cursor()  # type: ignore
-        # Check the schema:
-        self.__check_table_existence()
-        self.__check_stored_procedures()
+
+        userprovided.parameters.validate_dict_keys(
+            database_settings,
+            {'host', 'port', 'database', 'username', 'passphrase'},
+            {'database'},
+            'database_settings')
+
 
     def __prepare_bot(self, bot_behavior):
         # Seconds until a connection times out:
@@ -201,63 +216,6 @@ class Exoskeleton:
                     raise ValueError('milestone_num must be integer!')
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Bot Behavior
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-        # Seconds until a connection times out:
-        self.connection_timeout: int = 60
-
-        # Maximum number of retries if downloading a page/file failed:
-        self.queue_max_retries: int = 3
-        # Time to wait after the queue is empty to check for new elements:
-        self.queue_revisit: int = 60
-
-        self.wait_min: int = 5
-        self.wait_max: int = 30
-
-        self.stop_if_queue_empty: bool = False
-
-        if bot_behavior:
-            self.__check_behavior_settings(bot_behavior)
-
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # File Handling
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-        self.target_dir = pathlib.Path.cwd()
-
-        if target_directory is None or target_directory.strip() == '':
-            logging.warning("Target directory is not set. " +
-                            "Using the current working directory " +
-                            "%s to store files!",
-                            self.target_dir)
-        else:
-            # Assuming that if a directory was set, it has
-            # to be used. Therefore no fallback to the current
-            # working directory.
-            self.target_dir = pathlib.Path(target_directory).resolve()
-            if self.target_dir.is_dir():
-                logging.debug("Set target directory to %s",
-                              target_directory)
-            else:
-                raise OSError("Cannot find or access the user " +
-                              "supplied target directory! " +
-                              "Create this directory or check permissions.")
-
-        self.file_prefix = filename_prefix.strip()
-        # Limit the prefix length as on many systems the path must not be
-        # longer than 255 characters and it needs space for folders and the
-        # actual filename. 16 characters seems to be a reasonable limit.
-        if len(self.file_prefix) > 16:
-            raise ValueError('The file name prefix is limited to a ' +
-                             'maximum of 16 characters.')
-
-        self.hash_method = 'sha256'
-        if not userprovided.hash.hash_available(self.hash_method):
-            raise ValueError('The hash method SHA256 is not available on ' +
-                             'your system.')
-
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Init Timers
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -279,42 +237,6 @@ class Exoskeleton:
     # SETUP
     # Functions called from __init__ but outside of it for easier testing.
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def __check_database_settings(self,
-                                  database_settings: dict):
-        u"""Check the database settings for plausibility. """
-
-        userprovided.parameters.validate_dict_keys(
-            database_settings,
-            {'host', 'port', 'database', 'username', 'passphrase'},
-            {'database'},
-            'database_settings')
-
-        self.db_host = database_settings.get('host', None)
-        if not self.db_host:
-            logging.warning('No hostname provided. Will try localhost.')
-            self.db_host = 'localhost'
-
-        self.db_port = database_settings.get('port', None)
-        if not self.db_port:
-            logging.info('No port number supplied. ' +
-                         'Will try standard port instead.')
-            self.db_port = 3306
-        elif not userprovided.port.port_in_range(self.db_port):
-            raise ValueError('Port outside valid range!')
-
-        self.db_name = database_settings.get('database', None)
-        if not self.db_name:
-            raise ValueError('You must provide the name of the database.')
-
-        self.db_username = database_settings.get('username', None)
-        if not self.db_username:
-            raise ValueError('You must provide a database user.')
-
-        self.db_passphrase = database_settings.get('passphrase', '')
-        if self.db_passphrase == '':
-            logging.warning('No database passphrase provided. ' +
-                            'Will try to connect without.')
 
     def __check_behavior_settings(self,
                                   behavior_settings: dict):
@@ -372,78 +294,6 @@ class Exoskeleton:
         if type(self.stop_if_queue_empty) != bool:
             raise ValueError('The value for "stop_if_queue_empty" ' +
                              'must be a boolean (True / False).')
-
-    def __check_table_existence(self) -> bool:
-        u"""Check if all expected tables exist."""
-        logging.debug('Checking if the database table structure is complete.')
-        expected_tables = ['actions',
-                           'blocklist',  # TODO: Shouldn't that be `blockList`?
-                           'errorType',
-                           'fileContent',
-                           'fileMaster',
-                           'fileVersions',
-                           'jobs',
-                           'labels',
-                           'labelToMaster',
-                           'labelToVersion',
-                           'queue',
-                           'statisticsHosts',
-                           'storageTypes']
-        tables_count = 0
-
-        self.cur.execute('SHOW TABLES;')
-        tables = self.cur.fetchall()
-        if not tables:
-            logging.error('The database exists, but no tables found!')
-            raise OSError('Database table structure missing. ' +
-                          'Run generator script!')
-        else:
-            tables_found = [item[0] for item in tables]
-            for table in expected_tables:
-                if table in tables_found:
-                    tables_count += 1
-                    logging.debug('Found table %s', table)
-                else:
-                    logging.error('Table %s not found.', table)
-
-        if tables_count != len(expected_tables):
-            raise RuntimeError('Database Schema Incomplete: Missing Tables!')
-
-        logging.info("Found all expected tables.")
-        return True
-
-    def __check_stored_procedures(self) -> bool:
-        u"""Check if all expected stored procedures exist and if the user
-        is allowed to execute them. """
-        logging.debug('Checking if stored procedures exist.')
-        expected_procedures = ['delete_all_versions_SP',
-                               'delete_from_queue_SP',
-                               'insert_content_SP',
-                               'insert_file_SP',
-                               'next_queue_object_SP']
-
-        procedures_count = 0
-        self.cur.execute('SELECT SPECIFIC_NAME ' +
-                         'FROM INFORMATION_SCHEMA.ROUTINES ' +
-                         'WHERE ROUTINE_SCHEMA = %s;',
-                         self.db_name)
-        procedures = self.cur.fetchall()
-        procedures_found = [item[0] for item in procedures]
-        for procedure in expected_procedures:
-            if procedure in procedures_found:
-                procedures_count += 1
-                logging.debug('Found stored procedure %s', procedure)
-            else:
-                logging.error('Stored Procedure %s is missing (create it ' +
-                              'with the database script) or the user lacks ' +
-                              'permissions to use it.', procedure)
-
-        if procedures_count != len(expected_procedures):
-            raise RuntimeError('Database Schema Incomplete: ' +
-                               'Missing Stored Procedures!')
-
-        logging.info("Found all expected stored procedures.")
-        return True
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # ACTIONS
@@ -705,32 +555,6 @@ class Exoskeleton:
     # DATABASE MANAGEMENT
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def establish_db_connection(self):
-        u"""Establish a connection to MariaDB """
-        try:
-            logging.debug('Trying to connect to database.')
-            self.connection = pymysql.connect(host=self.db_host,
-                                              port=self.db_port,
-                                              database=self.db_name,
-                                              user=self.db_username,
-                                              password=self.db_passphrase,
-                                              autocommit=True)
-
-            logging.info('Established database connection.')
-
-        except pymysql.InterfaceError:
-            logging.exception('Exception related to the database ' +
-                              '*interface*.', exc_info=True)
-            raise
-        except pymysql.DatabaseError:
-            logging.exception('Exception related to the database.',
-                              exc_info=True)
-            raise
-        except Exception:
-            logging.exception('Unknown exception while ' +
-                              'trying to connect to the DBMS.',
-                              exc_info=True)
-            raise
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # JOB MANAGEMENT
@@ -1082,7 +906,7 @@ class Exoskeleton:
                     # this error is unusual. Give the db some time:
                     time.sleep(10)
                     try:
-                        self.establish_db_connection()
+                        self.connection = self.database.connect()
                         self.cur = self.connection.cursor()
                         next_in_queue = self.__get_next_task()
                         logging.info('Succesfully restored connection ' +
