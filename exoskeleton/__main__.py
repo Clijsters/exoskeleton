@@ -9,6 +9,7 @@ A Python framework to build a basic crawler / scraper with a MariaDB backend.
 
 # python standard library:
 from collections import Counter
+# noinspection PyUnresolvedReferences
 from collections import defaultdict
 import logging
 import pathlib
@@ -165,10 +166,10 @@ class Exoskeleton:
                          "as there are no mail-settings.")
         else:
             self.mailer = bote.Mailer(mail_settings)
-            # The constructur would have failed with exceptions,
-            # if the settings were inplausible:
+            # The constructor would have failed with exceptions,
+            # if the settings were implausible:
             self.send_mails = True
-            logging.info('This bot will try to send notications per mail ' +
+            logging.info('This bot will try to send notifications via mail ' +
                          'in case it fails and cannot recover. ')
 
             if mail_settings and not mail_behavior:
@@ -199,6 +200,85 @@ class Exoskeleton:
                 if not isinstance(self.milestone, int):
                     raise ValueError('milestone_num must be integer!')
 
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Bot Behavior
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+        # Seconds until a connection times out:
+        self.connection_timeout: int = 60
+
+        # Maximum number of retries if downloading a page/file failed:
+        self.queue_max_retries: int = 3
+        # Time to wait after the queue is empty to check for new elements:
+        self.queue_revisit: int = 60
+
+        self.wait_min: int = 5
+        self.wait_max: int = 30
+
+        self.stop_if_queue_empty: bool = False
+
+        if bot_behavior:
+            self.__check_behavior_settings(bot_behavior)
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # File Handling
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+        self.target_dir = pathlib.Path.cwd()
+
+        if target_directory is None or target_directory.strip() == '':
+            logging.warning("Target directory is not set. " +
+                            "Using the current working directory " +
+                            "%s to store files!",
+                            self.target_dir)
+        else:
+            # Assuming that if a directory was set, it has
+            # to be used. Therefore no fallback to the current
+            # working directory.
+            self.target_dir = pathlib.Path(target_directory).resolve()
+            if self.target_dir.is_dir():
+                logging.debug("Set target directory to %s",
+                              target_directory)
+            else:
+                raise OSError("Cannot find or access the user " +
+                              "supplied target directory! " +
+                              "Create this directory or check permissions.")
+
+        self.file_prefix = filename_prefix.strip()
+        # Limit the prefix length as on many systems the path must not be
+        # longer than 255 characters and it needs space for folders and the
+        # actual filename. 16 characters seems to be a reasonable limit.
+        if len(self.file_prefix) > 16:
+            raise ValueError('The file name prefix is limited to a ' +
+                             'maximum of 16 characters.')
+
+        self.hash_method = 'sha256'
+        if not userprovided.hash.hash_available(self.hash_method):
+            raise ValueError('The hash method SHA256 is not available on ' +
+                             'your system.')
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Init Timers
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+        self.bot_start = time.monotonic()
+        self.process_time_start = time.process_time()
+        logging.debug('started timers')
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Create Objects
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+        self.cnt: Counter = Counter()
+
+        self.local_download_queue: queue.Queue = queue.Queue()
+
+        self.chrome_process = chrome_name.strip()
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # SETUP
+    # Functions called from __init__ but outside of it for easier testing.
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def __check_database_settings(self,
                                   database_settings: dict):
@@ -297,7 +377,7 @@ class Exoskeleton:
         u"""Check if all expected tables exist."""
         logging.debug('Checking if the database table structure is complete.')
         expected_tables = ['actions',
-                           'blocklist',
+                           'blocklist',  # TODO: Shouldn't that be `blockList`?
                            'errorType',
                            'fileContent',
                            'fileMaster',
@@ -476,7 +556,7 @@ class Exoskeleton:
                 self.add_crawl_delay_to_item(queue_id)
                 self.__update_host_statistics(url, False)
             elif r.status_code not in (200, 402, 403, 404, 405, 410, 429, 451):
-                logging.error('Unhandeled return code %s', r.status_code)
+                logging.error('Unhandled return code %s', r.status_code)
                 self.__update_host_statistics(url, False)
 
         except TimeoutError:
@@ -494,12 +574,9 @@ class Exoskeleton:
             logging.error('New Connection Error: might be a rate limit',
                           exc_info=True)
             self.__update_host_statistics(url, False)
-            # Suppressing mypy errors as defaultdict and some checks
-            # makes ensure self.wait_min and self.wait_max will be
-            # float or int:
-            if self.wait_min < 10.0:  # type: ignore
-                self.wait_min = self.wait_min + 1.0  # type: ignore
-                self.wait_max = self.wait_max + 1.0  # type: ignore
+            if self.wait_min < 10:
+                self.wait_min = self.wait_min + 1
+                self.wait_max = self.wait_max + 1
                 logging.info('Increased min and max wait by 1 second each.')
 
         except requests.exceptions.MissingSchema:
@@ -766,7 +843,7 @@ class Exoskeleton:
     def random_wait(self):
         u"""Waits for a random time between actions
         (within the interval preset at initialization).
-        This is done to avoid to accidentially overload
+        This is done to avoid to accidentally overload
         the queried host. Some host actually enforce
         limits through IP blocking."""
         query_delay = random.randint(self.wait_min, self.wait_max)  # nosec
@@ -1029,7 +1106,7 @@ class Exoskeleton:
                 # no actionable item in the queue
                 if self.stop_if_queue_empty:
                     # Bot is configured to stop if queue is empty
-                    # => check if that is omnly temporary or everything is done
+                    # => check if that is only temporary or everything is done
                     self.cur.execute('SELECT num_items_with_temporary_errors();')
                     num_temp_errors = self.cur.fetchone()[0]
                     if num_temp_errors > 0:
@@ -1085,7 +1162,7 @@ class Exoskeleton:
                         # save page code into database
                         self.__get_object(queue_id, 'content',
                                           url, url_hash,
-                                          prettify_html)
+                                          prettify_html) # TODO: Type Check int to bool
                     elif action == 3:
                         # headless Chrome to create PDF
                         self.__page_to_pdf(url, url_hash, queue_id)
