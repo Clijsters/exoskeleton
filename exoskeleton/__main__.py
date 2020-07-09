@@ -20,7 +20,6 @@ from typing import Union, Optional
 from urllib.parse import urlparse
 import uuid
 
-
 # 3rd party libraries:
 import pymysql
 import urllib3  # type: ignore
@@ -63,43 +62,104 @@ class Exoskeleton:
         self.project = project_name.strip()
         self.user_agent = bot_user_agent.strip()
 
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Database Setup / Establish a Database Connection
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        self.__prepare_database(database_settings)
 
+        # Mail / Notification Setup
+        self.__prepare_mailing(mail_behavior, mail_settings)
+
+        # Bot Behavior
+        self.__prepare_bot(bot_behavior)
+
+        # File Handling
+        self.__prepare_file_handling(filename_prefix, target_directory)
+
+        # Init Timers
+        self.bot_start = time.monotonic()
+        self.process_time_start = time.process_time()
+        logging.debug('started timers')
+
+        # Create Objects
+        self.cnt = Counter()  # type: Counter
+        self.local_download_queue = queue.Queue()  # type: queue.Queue
+        self.chrome_process = chrome_name.strip()
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # SETUP
+    # Functions called from __init__ but outside of it for easier testing.
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def __prepare_file_handling(self, filename_prefix, target_directory):
+        self.target_dir = pathlib.Path.cwd()
+        if target_directory is None or target_directory.strip() == '':
+            logging.warning("Target directory is not set. " +
+                            "Using the current working directory " +
+                            "%s to store files!",
+                            self.target_dir)
+        else:
+            # Assuming that if a directory was set, it has
+            # to be used. Therefore no fallback to the current
+            # working directory.
+            self.target_dir = pathlib.Path(target_directory).resolve()
+            if self.target_dir.is_dir():
+                logging.debug("Set target directory to %s",
+                              target_directory)
+            else:
+                raise OSError("Cannot find or access the user " +
+                              "supplied target directory! " +
+                              "Create this directory or check permissions.")
+        self.file_prefix = filename_prefix.strip()
+        # Limit the prefix length as on many systems the path must not be
+        # longer than 255 characters and it needs space for folders and the
+        # actual filename. 16 characters semms to be a reasonable limit.
+        if len(self.file_prefix) > 16:
+            raise ValueError('The file name prefix is limited to a ' +
+                             'maximum of 16 characters.')
+        self.hash_method = 'sha256'
+        if not userprovided.hash.hash_available(self.hash_method):
+            raise ValueError('The hash method SHA256 is not available on ' +
+                             'your system.')
+
+    def __prepare_database(self, database_settings):
         self.db_host: Optional[str] = None
         self.db_port: Optional[int] = None
-        self.db_name: str = None  # type: ignore
-        self.db_username: str = None  # type: ignore
-        self.db_passphrase: str = None  # type: ignore
-
+        self.db_name: str
+        self.db_username: str
+        self.db_passphrase: str
         if database_settings is None:
             raise ValueError('You must supply database credentials for' +
                              'exoskeleton to work.')
         else:
             self.__check_database_settings(database_settings)
-
         # Establish the connection:
         self.connection = None
         self.establish_db_connection()
         # Add ignore for mypy as it cannot be None at this point, because
         # establish_db_connection would have failed before:
         self.cur = self.connection.cursor()  # type: ignore
-
         # Check the schema:
         self.__check_table_existence()
         self.__check_stored_procedures()
 
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Mail / Notification Setup
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    def __prepare_bot(self, bot_behavior):
+        # Seconds until a connection times out:
+        self.connection_timeout: int = 60
+        # Maximum number of retries if downloading a page/file failed:
+        self.queue_max_retries: int = 3
+        # Time to wait after the queue is empty to check for new elements:
+        self.queue_revisit: int = 60
+        self.wait_min: int = 5
+        self.wait_max: int = 30
+        self.stop_if_queue_empty: bool = False
+        if bot_behavior:
+            self.__check_behavior_settings(bot_behavior)
 
+    def __prepare_mailing(self, mail_behavior, mail_settings):
         self.send_mails: bool = False
         self.send_start_msg: bool = False
         self.send_finish_msg: bool = False
         self.milestone: Optional[int] = None
         self.mailer: Optional[bote.Mailer] = None
-
         if mail_settings is None:
             logging.info("Will not send any notification emails " +
                          "as there are no mail-settings.")
@@ -139,85 +199,6 @@ class Exoskeleton:
                 if not isinstance(self.milestone, int):
                     raise ValueError('milestone_num must be integer!')
 
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Bot Behavior
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-        # Seconds until a connection times out:
-        self.connection_timeout: int = 60
-
-        # Maximum number of retries if downloading a page/file failed:
-        self.queue_max_retries: int = 3
-        # Time to wait after the queue is empty to check for new elements:
-        self.queue_revisit: int = 60
-
-        self.wait_min: int = 5
-        self.wait_max: int = 30
-
-        self.stop_if_queue_empty: bool = False
-
-        if bot_behavior:
-            self.__check_behavior_settings(bot_behavior)
-
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # File Handling
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-        self.target_dir = pathlib.Path.cwd()
-
-        if target_directory is None or target_directory.strip() == '':
-            logging.warning("Target directory is not set. " +
-                            "Using the current working directory " +
-                            "%s to store files!",
-                            self.target_dir)
-        else:
-            # Assuming that if a directory was set, it has
-            # to be used. Therefore no fallback to the current
-            # working directory.
-            self.target_dir = pathlib.Path(target_directory).resolve()
-            if self.target_dir.is_dir():
-                logging.debug("Set target directory to %s",
-                              target_directory)
-            else:
-                raise OSError("Cannot find or access the user " +
-                              "supplied target directory! " +
-                              "Create this directory or check permissions.")
-
-        self.file_prefix = filename_prefix.strip()
-        # Limit the prefix length as on many systems the path must not be
-        # longer than 255 characters and it needs space for folders and the
-        # actual filename. 16 characters semms to be a reasonable limit.
-        if len(self.file_prefix) > 16:
-            raise ValueError('The file name prefix is limited to a ' +
-                             'maximum of 16 characters.')
-
-        self.hash_method = 'sha256'
-        if not userprovided.hash.hash_available(self.hash_method):
-            raise ValueError('The hash method SHA256 is not available on ' +
-                             'your system.')
-
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Init Timers
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-        self.bot_start = time.monotonic()
-        self.process_time_start = time.process_time()
-        logging.debug('started timers')
-
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Create Objects
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-        self.cnt = Counter()  # type: Counter
-
-        self.local_download_queue = queue.Queue()  # type: queue.Queue
-
-        self.chrome_process = chrome_name.strip()
-
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# SETUP
-# Functions called from __init__ but outside of it for easier testing.
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def __check_database_settings(self,
                                   database_settings: dict):
@@ -384,9 +365,9 @@ class Exoskeleton:
         logging.info("Found all expected stored procedures.")
         return True
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# ACTIONS
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # ACTIONS
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def __get_object(self,
                      queue_id: str,
@@ -643,9 +624,9 @@ class Exoskeleton:
             logging.exception('Exception while trying to get page-code',
                               exc_info=True)
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# DATABASE MANAGEMENT
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # DATABASE MANAGEMENT
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def establish_db_connection(self):
         u"""Establish a connection to MariaDB """
@@ -674,9 +655,9 @@ class Exoskeleton:
                               exc_info=True)
             raise
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# JOB MANAGEMENT
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # JOB MANAGEMENT
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def job_define_new(self,
                        job_name: str,
@@ -778,9 +759,9 @@ class Exoskeleton:
             raise ValueError('A job with this name is not known.')
         logging.debug('Marked job %s as finished.', job_name)
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# QUEUE MANAGEMENT
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # QUEUE MANAGEMENT
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def random_wait(self):
         u"""Waits for a random time between actions
@@ -976,7 +957,7 @@ class Exoskeleton:
         u"""Remove all label links from a queue item
             and then delete it from the queue."""
         # callproc expects a tuple. Do not remove the comma:
-        self.cur.callproc('delete_from_queue_SP', (queue_id, ))
+        self.cur.callproc('delete_from_queue_SP', (queue_id,))
 
     def add_crawl_delay_to_item(self,
                                 queue_id: str,
@@ -1201,9 +1182,10 @@ class Exoskeleton:
         u"""Remove *all* entries from the blocklist."""
         self.cur.execute('TRUNCATE TABLE blocklist;')
         pass
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# LABELS
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # LABELS
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def __define_new_label(self,
                            shortname: str,
